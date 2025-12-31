@@ -3,7 +3,7 @@ Infinite Memory Chat - Proof of Concept
 ========================================
 A chatbot with "infinite" memory by combining:
 - OpenAI Responses API for conversation
-- Vector Store for long-term memory
+- Vector Store for long-term memory (OpenAI or MongoDB)
 - Automatic archival of older messages
 """
 
@@ -11,7 +11,12 @@ import os
 import json
 import time
 from datetime import datetime
+from typing import Optional
 from openai import OpenAI
+from vector_backends.base import VectorBackend
+from vector_backends.openai_backend import OpenAIBackend
+from vector_backends.mongodb_backend import MongoDBBackend
+from config import BackendConfig, BackendType, create_backend
 
 # Configuration
 # =============================================================================
@@ -67,27 +72,43 @@ If you find relevant history, feel free to confirm this for the user."""
 
 
 class InfiniteMemoryChat:
-    def __init__(self):
-        self.client = OpenAI()
-        self.vector_store_id = None
+    def __init__(self, backend: Optional[VectorBackend] = None, config: Optional[BackendConfig] = None):
+        # Load configuration
+        self.config = config or BackendConfig.from_env()
+        
+        # Initialize OpenAI client for chat responses (always needed)
+        self.client = OpenAI(api_key=self.config.openai_api_key)
+        
+        # Initialize backend with fallback logic
+        if backend:
+            self.backend = backend
+            print(f"🔌 Using provided {type(backend).__name__}")
+        else:
+            try:
+                self.backend = create_backend(self.config)
+                print(f"🔌 Using {self.config.backend_type.value} backend")
+            except Exception as e:
+                print(f"⚠️ Error initializing {self.config.backend_type.value} backend: {e}")
+                print("🔄 Falling back to OpenAI backend...")
+                fallback_config = BackendConfig(
+                    backend_type=BackendType.OPENAI,
+                    openai_api_key=self.config.openai_api_key
+                )
+                self.backend = create_backend(fallback_config)
+        
+        # Initialize state
         self.conversation_history = []
         self.archive_count = 0
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.archived_files = []  # Track file IDs in order
-        self.consolidation_count = 0  # Number of times we've consolidated
+        self.store_id = None
         
     def setup_vector_store(self):
         """Create a new vector store for this session."""
-        print("📦 Creating vector store...")
-        vector_store = self.client.vector_stores.create(
-            name=f"chat_memory_{self.session_id}"
-        )
-        self.vector_store_id = vector_store.id
-        print(f"✅ Vector store created: {self.vector_store_id}")
-        return self.vector_store_id
+        self.store_id = self.backend.setup_store(self.session_id)
+        return self.store_id
     
     def archive_messages(self):
-        """Archive the oldest messages to vector store."""
+        """Archive the oldest messages using the selected backend."""
         if len(self.conversation_history) < MAX_MESSAGES:
             return
         
@@ -95,192 +116,33 @@ class InfiniteMemoryChat:
         messages_to_archive = self.conversation_history[:ARCHIVE_COUNT]
         self.conversation_history = self.conversation_history[ARCHIVE_COUNT:]
         
-        # Create JSON file with metadata
         self.archive_count += 1
-        archive_data = {
-            "archive_id": self.archive_count,
-            "session_id": self.session_id,
-            "timestamp": datetime.now().isoformat(),
-            "message_range": f"messages {(self.archive_count-1)*ARCHIVE_COUNT + 1}-{self.archive_count*ARCHIVE_COUNT}",
-            "messages": messages_to_archive
-        }
-        
-        # Create summary text for better embeddings
-        summary_text = f"Conversation archive #{self.archive_count}\n"
-        summary_text += f"Timestamp: {archive_data['timestamp']}\n"
-        summary_text += f"Content:\n"
-        for msg in messages_to_archive:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            summary_text += f"\n{role}: {msg['content']}\n"
-        
-        # Save to file
-        filename = f"/tmp/archive_{self.session_id}_{self.archive_count}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump({"summary": summary_text, "data": archive_data}, f, ensure_ascii=False, indent=2)
-        
-        print(f"\n📁 Archiving {ARCHIVE_COUNT} messages to vector store...")
-        
-        # Upload to vector store
-        with open(filename, "rb") as f:
-            file_obj = self.client.files.create(file=f, purpose="assistants")
-        
-        self.client.vector_stores.files.create(
-            vector_store_id=self.vector_store_id,
-            file_id=file_obj.id
+        success = self.backend.archive_messages(
+            messages_to_archive, 
+            self.archive_count, 
+            self.session_id
         )
         
-        # Save file ID for later consolidation
-        self.archived_files.append({
-            "file_id": file_obj.id,
-            "archive_id": self.archive_count,
-            "filename": filename
-        })
+        if success and self.backend.should_consolidate(MAX_ARCHIVE_FILES):
+            print(f"\n🔄 Max archive files reached - consolidating...")
+            self._trigger_consolidation()
+            
+    def _trigger_consolidation(self):
+        """Delegate consolidation to backend."""
+        # Get oldest archives to consolidate  
+        archive_ids = []
+        for i in range(min(CONSOLIDATION_COUNT, self.backend.get_archive_count())):
+            archive_ids.append(str(i + 1))  # Simple sequential IDs for now
         
-        # Wait for indexing
-        self._wait_for_indexing(file_obj.id)
-        print(f"✅ Archive #{self.archive_count} saved and indexed")
-        
-        # Check if we need to consolidate
-        self._check_consolidation()
-        
-    def _wait_for_indexing(self, file_id, timeout=30):
-        """Wait until the file is indexed in vector store."""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            file_status = self.client.vector_stores.files.retrieve(
-                vector_store_id=self.vector_store_id,
-                file_id=file_id
-            )
-            if file_status.status == "completed":
-                return True
-            time.sleep(1)
-        print("⚠️ Timeout while indexing")
-        return False
-    
-    def _check_consolidation(self):
-        """Check if we need to consolidate older files."""
-        if len(self.archived_files) >= MAX_ARCHIVE_FILES:
-            print(f"\n🔄 Max archive files ({MAX_ARCHIVE_FILES}) reached - consolidating...")
-            self._consolidate_files()
-    
-    def _consolidate_files(self):
-        """
-        Merge the oldest files into a single large file.
-        No summarization - all data is preserved intact.
-        50 files → 1 file = takes 50x longer to reach 10,000 file limit.
-        
-        If the resulting file would exceed MAX_FILE_SIZE_BYTES,
-        we skip already large consolidated files.
-        """
-        files_to_consolidate = self.archived_files[:CONSOLIDATION_COUNT]
-        
-        # Separate already consolidated files that are near the size limit
-        large_consolidated = []
-        files_to_merge = []
-        
-        for file_info in files_to_consolidate:
-            if file_info.get("is_consolidated"):
-                # Check file size
-                try:
-                    file_size = os.path.getsize(file_info["filename"])
-                    if file_size > MAX_FILE_SIZE_BYTES * 0.8:  # 80% of limit
-                        large_consolidated.append(file_info)
-                        print(f"⚠️ Skipping large file ({file_size / 1024 / 1024:.1f} MB)")
-                        continue
-                except FileNotFoundError:
-                    pass
-            files_to_merge.append(file_info)
-        
-        if not files_to_merge:
-            print("⚠️ No files to consolidate (all are too large)")
-            return
-        
-        # Collect all content from files to merge
-        all_archives = []
-        for file_info in files_to_merge:
-            try:
-                with open(file_info["filename"], "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # If it's a consolidated file, extract its archives
-                    if file_info.get("is_consolidated") and "archives" in data:
-                        all_archives.extend(data["archives"])
-                    else:
-                        all_archives.append(data)
-            except FileNotFoundError:
-                print(f"⚠️ Could not read {file_info['filename']}")
-                continue
-        
-        self.consolidation_count += 1
-        
-        print(f"📦 Merging {len(files_to_merge)} files into 1...")
-        
-        # Create merged file with all data
-        consolidated_data = {
-            "type": "consolidated_archive",
-            "consolidation_id": self.consolidation_count,
-            "session_id": self.session_id,
-            "timestamp": datetime.now().isoformat(),
-            "original_archive_ids": [f["archive_id"] for f in files_to_merge],
-            "file_count": len(all_archives),
-            "archives": all_archives  # All original data preserved
-        }
-        
-        filename = f"/tmp/consolidated_{self.session_id}_{self.consolidation_count}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(consolidated_data, f, ensure_ascii=False, indent=2)
-        
-        # Check resulting file size
-        file_size = os.path.getsize(filename)
-        file_size_mb = file_size / 1024 / 1024
-        print(f"📏 Consolidated file size: {file_size_mb:.1f} MB / {MAX_FILE_SIZE_MB} MB")
-        
-        if file_size > MAX_FILE_SIZE_BYTES:
-            print(f"❌ File too large! Aborting consolidation.")
-            os.remove(filename)
-            return
-        
-        # Remove old files from vector store
-        print(f"🗑️ Removing {len(files_to_merge)} old archive files...")
-        for file_info in files_to_merge:
-            try:
-                self.client.vector_stores.files.delete(
-                    vector_store_id=self.vector_store_id,
-                    file_id=file_info["file_id"]
-                )
-                self.client.files.delete(file_id=file_info["file_id"])
-            except Exception as e:
-                print(f"⚠️ Could not delete file: {e}")
-        
-        # Upload consolidated file
-        print(f"📤 Uploading merged file...")
-        with open(filename, "rb") as f:
-            file_obj = self.client.files.create(file=f, purpose="assistants")
-        
-        self.client.vector_stores.files.create(
-            vector_store_id=self.vector_store_id,
-            file_id=file_obj.id
-        )
-        
-        self._wait_for_indexing(file_obj.id)
-        
-        # Update our list of archived files
-        # Keep large consolidated files, remove merged ones, add new one
-        merged_ids = {f["archive_id"] for f in files_to_merge}
-        self.archived_files = [f for f in self.archived_files if f["archive_id"] not in merged_ids]
-        
-        self.archived_files.insert(0, {
-            "file_id": file_obj.id,
-            "archive_id": f"consolidated_{self.consolidation_count}",
-            "filename": filename,
-            "is_consolidated": True
-        })
-        
-        print(f"✅ Consolidation #{self.consolidation_count} complete!")
-        print(f"   {len(files_to_merge)} files → 1 file (all data preserved)")
-        print(f"   Archive files now: {len(self.archived_files)}")
+        if archive_ids:
+            result = self.backend.consolidate_archives(archive_ids)
+            if result:
+                print(f"✅ Backend consolidation complete: {result}")
+            else:
+                print("⚠️ Backend consolidation failed")
     
     def chat(self, user_message: str) -> str:
-        """Send a message and get a response."""
+        """Send a message and get a response with backend-aware memory search."""
         
         # Add user's message to history
         self.conversation_history.append({
@@ -290,21 +152,49 @@ class InfiniteMemoryChat:
         
         # Build messages array for API call
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+        # For MongoDB backend, search archives and add context if archives exist
+        if isinstance(self.backend, MongoDBBackend) and self.archive_count > 0:
+            try:
+                # Search for relevant archived conversations
+                search_results = self.backend.search_archives(user_message, limit=3)
+                
+                if search_results:
+                    print(f"🔍 Found {len(search_results)} relevant archive(s)")
+                    # Add retrieved context to system prompt
+                    context_addon = "\n\nRelevant conversation history from your memory:\n"
+                    for result in search_results:
+                        context_addon += f"\n--- Archive #{result.get('archive_id', 'unknown')} (Score: {result.get('score', 0):.3f}) ---\n"
+                        # Add messages from the archive
+                        for msg in result.get('messages', []):
+                            role = "User" if msg["role"] == "user" else "Assistant"
+                            context_addon += f"{role}: {msg['content']}\n"
+                    
+                    # Update system prompt with context
+                    enhanced_system_prompt = SYSTEM_PROMPT + context_addon
+                    messages = [{"role": "system", "content": enhanced_system_prompt}]
+                
+            except Exception as e:
+                print(f"⚠️ Error searching archives: {e}")
+        
+        # Add current conversation
         messages.extend(self.conversation_history)
         
-        # Make API call with file_search if vector store exists and has content
-        if self.vector_store_id and self.archive_count > 0:
+        # Make API call - backend-specific handling
+        if isinstance(self.backend, OpenAIBackend) and self.store_id and self.archive_count > 0:
+            # OpenAI backend uses file_search tool
             response = self.client.responses.create(
-                model=MODEL,
+                model=self.config.chat_model,
                 input=messages,
                 tools=[{
                     "type": "file_search",
-                    "vector_store_ids": [self.vector_store_id]
+                    "vector_store_ids": [self.backend.vector_store_id]
                 }]
             )
         else:
+            # MongoDB backend or no archives - use standard completion
             response = self.client.responses.create(
-                model=MODEL,
+                model=self.config.chat_model,
                 input=messages
             )
         
@@ -324,21 +214,16 @@ class InfiniteMemoryChat:
     
     def get_status(self):
         """Get conversation status."""
-        # Calculate total size of consolidated files
-        total_consolidated_size = 0
-        for f in self.archived_files:
-            if f.get("is_consolidated"):
-                try:
-                    total_consolidated_size += os.path.getsize(f["filename"])
-                except FileNotFoundError:
-                    pass
+        backend_status = self.backend.get_status()
         
         return {
             "active_messages": len(self.conversation_history),
-            "archived_files": len(self.archived_files),
-            "consolidations": self.consolidation_count,
+            "archived_files": backend_status.get("archived_files", 0),
+            "consolidations": backend_status.get("consolidations", 0),
             "total_messages": len(self.conversation_history) + (self.archive_count * ARCHIVE_COUNT),
-            "consolidated_size_mb": total_consolidated_size / 1024 / 1024
+            "consolidated_size_mb": backend_status.get("consolidated_size_mb", 0),
+            "backend_type": backend_status.get("backend_type", "unknown"),
+            "store_id": self.store_id
         }
 
 
@@ -346,19 +231,55 @@ def main():
     print("=" * 60)
     print("🧠 Infinite Memory Chat - Proof of Concept")
     print("=" * 60)
+    
+    # Load configuration from environment
+    config = BackendConfig.from_env()
+    
+    # Display configuration
     print(f"Configuration:")
+    print(f"  • Vector Backend: {config.backend_type.value.upper()}")
+    print(f"  • Chat Model: {config.chat_model}")
+    print(f"  • Embedding Model: {config.embedding_model}")
     print(f"  • Max {MAX_MESSAGES} active messages")
     print(f"  • Archive {ARCHIVE_COUNT} messages at a time")
     print(f"  • Consolidate at {MAX_ARCHIVE_FILES} files ({CONSOLIDATION_COUNT}→1)")
     print(f"  • Max file size: {MAX_FILE_SIZE_MB} MB")
     print(f"  • Theoretical max: ~{CONSOLIDATION_COUNT * MAX_FILE_SIZE_MB / 1024:.0f} GB history")
+    
+    # Display backend-specific info
+    if config.backend_type == BackendType.MONGODB:
+        db_name = config.mongodb_database
+        # Mask connection string for security
+        conn_str = config.mongodb_connection_string
+        if conn_str:
+            if '@' in conn_str:
+                # Hide credentials: mongodb+srv://user:pass@host -> mongodb+srv://***@host
+                masked_conn = conn_str.split('@')[0].split('//')[0] + '//***@' + conn_str.split('@')[1]
+            else:
+                masked_conn = conn_str
+            print(f"  • MongoDB Database: {db_name}")
+            print(f"  • Connection: {masked_conn}")
+    
     print("Type 'quit' to exit, 'status' for statistics")
     print("=" * 60 + "\n")
     
-    chat = InfiniteMemoryChat()
-    chat.setup_vector_store()
-    
-    print("\n🚀 Ready to chat!\n")
+    # Initialize chat with configuration
+    try:
+        print("🔧 Initializing backend...")
+        chat = InfiniteMemoryChat(config=config)
+        chat.setup_vector_store()
+        
+        # Display backend status
+        backend_status = chat.backend.get_status()
+        backend_name = backend_status.get("backend_type", "unknown").upper()
+        connection_status = backend_status.get("connection_status", "unknown")
+        print(f"✅ {backend_name} backend initialized ({connection_status})")
+        print("\n🚀 Ready to chat!\n")
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize backend: {e}")
+        print("💡 Check your configuration in .env file or environment variables")
+        return
     
     while True:
         try:
@@ -373,12 +294,32 @@ def main():
             
             if user_input.lower() == "status":
                 status = chat.get_status()
-                print(f"\n📊 Status:")
+                backend_status = chat.backend.get_status()
+                
+                print(f"\n📊 System Status:")
+                print(f"   Vector Backend: {status['backend_type'].upper()}")
                 print(f"   Active messages: {status['active_messages']}/{MAX_MESSAGES}")
                 print(f"   Archive files in vector store: {status['archived_files']}/{MAX_ARCHIVE_FILES}")
                 print(f"   Consolidations performed: {status['consolidations']}")
                 print(f"   Consolidated data: {status['consolidated_size_mb']:.1f} MB / {CONSOLIDATION_COUNT * MAX_FILE_SIZE_MB / 1024:.0f} GB theoretical max")
-                print(f"   Total messages (history): {status['total_messages']}\n")
+                print(f"   Total messages (history): {status['total_messages']}")
+                
+                # Backend-specific status
+                if config.backend_type == BackendType.MONGODB:
+                    print(f"\n🍃 MongoDB Status:")
+                    print(f"   Connection: {backend_status.get('connection_status', 'unknown')}")
+                    print(f"   Database: {backend_status.get('database_name', 'unknown')}")
+                    print(f"   Collection: {backend_status.get('collection_name', 'not initialized')}")
+                    print(f"   Total documents: {backend_status.get('total_documents', 0)}")
+                    print(f"   Storage size: {backend_status.get('storage_size_mb', 0):.1f} MB")
+                    print(f"   Embedding model: {backend_status.get('embedding_model', 'unknown')}")
+                elif config.backend_type == BackendType.OPENAI:
+                    print(f"\n🤖 OpenAI Status:")
+                    print(f"   Vector store ID: {status.get('store_id', 'not initialized')}")
+                    print(f"   Chat model: {config.chat_model}")
+                    print(f"   Embedding model: {config.embedding_model}")
+                
+                print("")
                 continue
             
             response = chat.chat(user_input)
