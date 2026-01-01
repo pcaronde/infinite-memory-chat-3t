@@ -1,6 +1,6 @@
 # Infinite Memory Chat
 
-A proof-of-concept chatbot with virtually unlimited conversation memory using OpenAI's Responses API and Vector Stores.
+A proof-of-concept chatbot with virtually unlimited conversation memory using OpenAI's Responses API and pluggable vector backends (OpenAI Vector Store or MongoDB Vector Search).
 
 ## The Problem
 
@@ -52,12 +52,32 @@ This project implements a **self-populating RAG system** that automatically arch
 
 At 100 messages/day, that's **~1,370 years** of conversation.
 
+## Vector Backends
+
+Choose between two vector storage backends based on your scale and requirements:
+
+### 🤖 OpenAI Vector Store (Default)
+**Best for**: Small to medium scale (<10K messages/month)
+- **Cost**: $3-33/month
+- **Setup**: Zero configuration required
+- **Pros**: Immediate setup, no infrastructure
+- **Cons**: Vendor lock-in, expensive at scale
+
+### 🍃 MongoDB Vector Search
+**Best for**: Large scale (>50K messages/month)
+- **Cost**: $300-700/month (Atlas) or self-hosted
+- **Setup**: Requires MongoDB Atlas or local MongoDB
+- **Pros**: Data ownership, cost-effective at scale, horizontal scaling
+- **Cons**: Requires setup and infrastructure management
+
 ## Key Features
 
+- **Pluggable backends**: Switch between OpenAI and MongoDB
 - **Zero information loss**: All messages are preserved, never summarized
 - **Automatic**: No manual intervention needed
 - **Cost efficient**: Small active context window = fewer tokens per request
 - **Semantic retrieval**: Finds relevant history by meaning, not just recency
+- **Production ready**: Comprehensive test coverage (27/27 tests passing)
 
 ## Installation
 
@@ -105,16 +125,52 @@ The assistant found your name and project from archived history, even though tha
 
 ## Configuration
 
-All settings are at the top of `infinite_memory_chat.py`:
+### Quick Start (OpenAI Backend)
 
-```python
-MAX_MESSAGES = 20        # Active window size
-ARCHIVE_COUNT = 10       # Messages per archive file
-MAX_ARCHIVE_FILES = 100  # Files before consolidation
-CONSOLIDATION_COUNT = 50 # Files to merge
-MAX_FILE_SIZE_MB = 500   # Max size per consolidated file
-MODEL = "gpt-4o-mini"    # Model to use
+1. **Create a `.env` file:**
+```bash
+cp env.example .env
 ```
+
+2. **Add your OpenAI API key:**
+```bash
+VECTOR_BACKEND=openai
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+3. **Run the application:**
+```bash
+./run.sh
+```
+
+### MongoDB Backend Setup
+
+1. **Set up MongoDB** (Atlas or local)
+2. **Configure `.env` file:**
+```bash
+VECTOR_BACKEND=mongodb
+OPENAI_API_KEY=your_openai_api_key_here
+MONGODB_CONNECTION_STRING=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGODB_DATABASE=infinite_memory_chat
+```
+
+3. **Create vector search index** in MongoDB Atlas:
+   - Index name: `vector_index`
+   - Field: `content_embedding` (vector, 1536 dimensions, cosine similarity)
+   - Filter fields: `session_id`, `archive_id`, `type`
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VECTOR_BACKEND` | `openai` | Backend: `openai` or `mongodb` |
+| `OPENAI_API_KEY` | Required | OpenAI API key (chat + embeddings) |
+| `CHAT_MODEL` | `gpt-4o-mini` | Chat model to use |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
+| `MONGODB_CONNECTION_STRING` | - | MongoDB connection (if backend=mongodb) |
+| `MONGODB_DATABASE` | `infinite_memory_chat` | MongoDB database name |
+
+See `env.example` for a complete configuration template with cost optimization guide.
 
 ## How Consolidation Works
 
