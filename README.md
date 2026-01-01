@@ -70,6 +70,8 @@ Choose between two vector storage backends based on your scale and requirements:
 - **Pros**: Data ownership, cost-effective at scale, horizontal scaling
 - **Cons**: Requires setup and infrastructure management
 
+*_Cost estimation comparisons as of 2026-01-01_
+
 ## Key Features
 
 - **Pluggable backends**: Switch between OpenAI and MongoDB
@@ -145,7 +147,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ### MongoDB Backend Setup
 
-1. **Set up MongoDB** (Atlas or local)
+1. **Set up MongoDB** (Atlas or local MongoDB CE >8.2.x)
 2. **Configure `.env` file:**
 ```bash
 VECTOR_BACKEND=mongodb
@@ -154,7 +156,7 @@ MONGODB_CONNECTION_STRING=mongodb+srv://user:pass@cluster.mongodb.net/
 MONGODB_DATABASE=infinite_memory_chat
 ```
 
-3. **Create vector search index** in MongoDB Atlas:
+3. **Create vector search index** in MongoDB Atlas or CE >8.2.x:
    - Index name: `vector_index`
    - Field: `content_embedding` (vector, 1536 dimensions, cosine similarity)
    - Filter fields: `session_id`, `archive_id`, `type`
