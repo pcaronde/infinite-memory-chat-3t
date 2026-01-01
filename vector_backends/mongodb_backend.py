@@ -70,7 +70,7 @@ class MongoDBBackend(VectorBackend):
         # For now, we'll document the required index structure.
         
         print(f"✅ MongoDB collection created: {self.collection_name}")
-        print("ℹ️  Vector search index required (create manually in Atlas):")
+        print("ℹ️  Vector search index required (create manually in MongoDB CE 8.2.x or Atlas):")
         print("   Index name: vector_index")
         print("   Field: content_embedding (vector, 1536 dimensions, cosine)")
         print("   Filter fields: session_id, archive_id, type")
@@ -79,7 +79,7 @@ class MongoDBBackend(VectorBackend):
     
     def archive_messages(self, messages: List[Dict], archive_id: int, session_id: str) -> bool:
         """Archive messages to MongoDB with vector embeddings."""
-        if not self.collection:
+        if self.collection is None:
             print("❌ MongoDB collection not initialized")
             return False
             
@@ -135,7 +135,7 @@ class MongoDBBackend(VectorBackend):
     
     def search_archives(self, query_text: str, limit: int = 10) -> List[Dict]:
         """Search archived messages using MongoDB vector search."""
-        if not self.collection:
+        if self.collection is None:
             print("❌ MongoDB collection not initialized")
             return []
         
@@ -197,7 +197,7 @@ class MongoDBBackend(VectorBackend):
         Consolidate multiple archives into a single document.
         Unlike file-based consolidation, this merges documents in the database.
         """
-        if not self.collection or not archive_ids:
+        if self.collection is None or not archive_ids:
             return None
             
         try:
@@ -278,7 +278,7 @@ class MongoDBBackend(VectorBackend):
     
     def get_archive_count(self) -> int:
         """Get the number of archived message groups."""
-        if not self.collection:
+        if self.collection is None:
             return 0
             
         try:
@@ -290,7 +290,7 @@ class MongoDBBackend(VectorBackend):
     
     def cleanup_archives(self, archive_ids: List[str]) -> bool:
         """Remove specified archives from MongoDB."""
-        if not self.collection:
+        if self.collection is None:
             return False
             
         try:
@@ -325,8 +325,8 @@ class MongoDBBackend(VectorBackend):
             "consolidated_size_mb": 0,  # MongoDB doesn't have direct file sizes
             "connection_status": "disconnected"
         }
-        
-        if self.collection:
+
+        if self.collection is not None:
             try:
                 # Get document counts by type
                 archive_count = self.collection.count_documents({"type": "archive"})
@@ -353,7 +353,7 @@ class MongoDBBackend(VectorBackend):
     
     def should_consolidate(self, max_archives: int) -> bool:
         """Check if consolidation should be triggered."""
-        if not self.collection:
+        if self.collection is None:
             return False
             
         try:
