@@ -9,14 +9,14 @@ echo "🧠 Infinite Memory Chat - Setup & Launch"
 echo "========================================"
 
 # Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
+if [ ! -d ".venv" ]; then
     echo "📦 Creating virtual environment..."
-    python3 -m venv venv
+    python3.13 -m venv .venv
 fi
 
 # Activate virtual environment
 echo "🔄 Activating virtual environment..."
-source venv/bin/activate
+source .venv/bin/activate
 
 # Install dependencies
 echo "📥 Installing dependencies..."
@@ -78,4 +78,4 @@ echo "========================================"
 echo ""
 
 # Run the chat
-python3 infinite_memory_chat.py
+python3.13 infinite_memory_chat.py
