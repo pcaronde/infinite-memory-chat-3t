@@ -1,23 +1,32 @@
 """
-MongoDB Vector Search backend implementation.
+MongoDB Vector Search backend implementation with reliability and performance improvements.
 """
 
 import os
 import json
 import struct
+import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pymongo import MongoClient
 from pymongo.collection import Collection
-from pymongo.errors import PyMongoError, OperationFailure
+from pymongo.errors import PyMongoError, OperationFailure, ServerSelectionTimeoutError, AutoReconnect
 from bson import Binary
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIError
+import logging
 
 from .base import VectorBackend
+from input_validator import input_validator, security_audit_logger
+from connection_monitor import MongoDBConnectionMonitor, connection_health_manager
+from error_recovery import error_recovery_manager, graceful_degradation_manager
+from rate_limit_manager import DEFAULT_CONFIGS, AdaptiveRateLimitManager
+
+# Configure logging
+logger = logging.getLogger("infinite_memory_chat")
 
 
 class MongoDBBackend(VectorBackend):
-    """MongoDB Vector Search backend implementation."""
+    """MongoDB Vector Search backend implementation with enhanced reliability."""
     
     def __init__(self, 
                  connection_string: str, 
@@ -38,6 +47,12 @@ class MongoDBBackend(VectorBackend):
         # State tracking
         self.archive_count = 0
         self.consolidated_archives = []
+        
+        # Initialize reliability features
+        self.connection_monitor = None
+        self.rate_limit_manager = AdaptiveRateLimitManager(DEFAULT_CONFIGS["moderate"])
+        
+        logger.info(f"MongoDB backend initialized with reliability features")
         
     def _connect(self):
         """Establish MongoDB connection if not already connected."""
@@ -78,14 +93,36 @@ class MongoDBBackend(VectorBackend):
         return self.collection_name
     
     def archive_messages(self, messages: List[Dict], archive_id: int, session_id: str) -> bool:
-        """Archive messages to MongoDB with vector embeddings."""
+        """Archive messages to MongoDB with vector embeddings and enhanced error handling."""
         if self.collection is None:
-            print("❌ MongoDB collection not initialized")
+            error_info = error_recovery_manager.handle_error(
+                ValueError("MongoDB collection not initialized"),
+                {"operation": "archive_messages", "archive_id": archive_id}
+            )
+            print(f"❌ {error_info.user_message}")
             return False
             
         print(f"📁 Archiving {len(messages)} messages to MongoDB...")
         
         try:
+            # Validate inputs first
+            try:
+                session_id = input_validator.validate_session_id(session_id)
+                
+                # Validate messages
+                for i, msg in enumerate(messages):
+                    if not isinstance(msg, dict) or 'content' not in msg:
+                        raise ValueError(f"Invalid message format at index {i}")
+                    msg['content'] = input_validator.validate_user_message(msg['content'])
+                    
+            except Exception as validation_error:
+                error_info = error_recovery_manager.handle_error(
+                    validation_error,
+                    {"operation": "archive_validation", "archive_id": archive_id}
+                )
+                print(f"❌ {error_info.user_message}")
+                return False
+            
             # Create summary text for embedding
             summary_text = f"Conversation archive #{archive_id}\n"
             summary_text += f"Timestamp: {datetime.now().isoformat()}\n"
@@ -95,15 +132,56 @@ class MongoDBBackend(VectorBackend):
                 role = "User" if msg["role"] == "user" else "Assistant"
                 summary_text += f"\n{role}: {msg['content']}\n"
             
-            # Generate embedding using OpenAI
+            # Generate embedding using OpenAI with rate limiting
             print(f"🧠 Generating embedding for archive #{archive_id}...")
-            embedding_response = self.embedding_client.embeddings.create(
-                model=self.embedding_model,
-                input=summary_text
-            )
-            embedding_vector = embedding_response.data[0].embedding
             
-            # Convert to BinData for efficient storage (optional - can use array too)
+            # Wait for rate limiting if needed
+            wait_time = self.rate_limit_manager.wait_if_needed(estimated_tokens=len(summary_text) // 4)
+            if wait_time > 0.1:
+                print(f"⏱️ Waiting {wait_time:.1f}s for rate limiting...")
+            
+            start_time = time.time()
+            try:
+                embedding_response = self.embedding_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=summary_text
+                )
+                
+                # Validate API response
+                validated_response = input_validator.validate_openai_response(embedding_response.model_dump())
+                embedding_vector = validated_response['data'][0]['embedding']
+                
+                # Record successful API request
+                response_time = (time.time() - start_time) * 1000
+                self.rate_limit_manager.record_request(
+                    tokens_used=len(summary_text) // 4,  # Rough estimate
+                    response_time_ms=response_time,
+                    was_rate_limited=False,
+                    error_occurred=False
+                )
+                
+            except (RateLimitError, APIError) as api_error:
+                response_time = (time.time() - start_time) * 1000
+                was_rate_limited = isinstance(api_error, RateLimitError)
+                
+                # Record failed API request
+                self.rate_limit_manager.record_request(
+                    tokens_used=0,
+                    response_time_ms=response_time,
+                    was_rate_limited=was_rate_limited,
+                    error_occurred=True
+                )
+                
+                # Handle the error with recovery
+                error_info = error_recovery_manager.handle_error(
+                    api_error,
+                    {"operation": "embedding_generation", "archive_id": archive_id}
+                )
+                print(f"❌ {error_info.user_message}")
+                print(f"💡 {error_info.suggestion}")
+                return False
+            
+            # Convert to BinData for efficient storage
             embedding_bindata = self._vector_to_bindata(embedding_vector)
             
             # Create document with comprehensive metadata
@@ -122,15 +200,50 @@ class MongoDBBackend(VectorBackend):
                 "created_at": datetime.now()
             }
             
-            # Insert document
-            result = self.collection.insert_one(archive_doc)
-            self.archive_count += 1
+            # Validate document before insertion
+            try:
+                validated_doc = input_validator.validate_mongodb_document(archive_doc)
+            except Exception as doc_error:
+                error_info = error_recovery_manager.handle_error(
+                    doc_error,
+                    {"operation": "document_validation", "archive_id": archive_id}
+                )
+                print(f"❌ {error_info.user_message}")
+                return False
             
-            print(f"✅ Archive #{archive_id} saved to MongoDB (ID: {result.inserted_id})")
-            return True
+            # Insert document with MongoDB error handling
+            try:
+                result = self.collection.insert_one(validated_doc)
+                self.archive_count += 1
+                
+                print(f"✅ Archive #{archive_id} saved to MongoDB (ID: {result.inserted_id})")
+                logger.info(f"Successfully archived {len(messages)} messages for archive #{archive_id}")
+                return True
+                
+            except (PyMongoError, ServerSelectionTimeoutError, AutoReconnect) as mongo_error:
+                error_info = error_recovery_manager.handle_error(
+                    mongo_error,
+                    {"operation": "mongodb_insert", "archive_id": archive_id}
+                )
+                print(f"❌ {error_info.user_message}")
+                print(f"💡 {error_info.suggestion}")
+                
+                # Trigger graceful degradation if needed
+                if isinstance(mongo_error, ServerSelectionTimeoutError):
+                    graceful_degradation_manager.degrade_to_mode(
+                        "limited_memory", 
+                        f"MongoDB connection timeout: {mongo_error}"
+                    )
+                
+                return False
             
-        except Exception as e:
-            print(f"❌ Error archiving to MongoDB: {e}")
+        except Exception as unexpected_error:
+            error_info = error_recovery_manager.handle_error(
+                unexpected_error,
+                {"operation": "archive_messages", "archive_id": archive_id}
+            )
+            print(f"❌ {error_info.user_message}")
+            logger.error(f"Unexpected error in archive_messages: {unexpected_error}", exc_info=True)
             return False
     
     def search_archives(self, query_text: str, limit: int = 10) -> List[Dict]:
