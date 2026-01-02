@@ -5,7 +5,7 @@
 
 set -e  # Exit on any error
 
-echo "🧠 Infinite Memory Chat - Setup & Launch"
+echo "🧠 Infinite Memory Chat - Setup & Launch 3T version"
 echo "========================================"
 
 # Create virtual environment if it doesn't exist
@@ -79,3 +79,4 @@ echo ""
 
 # Run the chat
 python3.14 infinite_memory_chat.py
+
