@@ -38,7 +38,7 @@ This project implements a **self-populating RAG system** that automatically arch
 
 1. **Normal Chat**: Messages accumulate in the active conversation window
 2. **Auto-Archive**: When the window reaches 20 messages, the oldest 10 are saved to the vector store as a JSON file
-3. **Semantic Search**: The LLM uses `file_search` to retrieve relevant history when needed
+3. **Semantic Search**: The LLM uses `file_search` or `vector_index`to retrieve relevant history when needed
 4. **Auto-Consolidate**: When archive files reach 100, the oldest 50 are merged into one file
 5. **Size Management**: Large consolidated files (>400 MB) are preserved separately
 
